@@ -13,6 +13,7 @@
 - 交接后旧封存人不得再签发；非参与方与不存在资料沿用统一拒绝语义（403）。
 """
 import base64
+import contextlib
 import datetime as dt
 import json
 import os
@@ -250,6 +251,290 @@ def test_old_snapshot_remains_valid_after_later_operations(client):
     r = _verify(client, pkg1["snapshot"], pkg1["signature"], pk["public_key"])
     assert r.status_code == 200
     assert r.json()["valid"] is True and r.json()["status"] == "sealed"
+
+
+# ---------------------------------------------------------------------------
+# 时间边界：签发的时间判定以取得写锁后的实际时刻为准
+#
+# 签发请求在最早开封/计划清除时刻之前到达、等待 BEGIN IMMEDIATE 写锁期间
+# 越过这些时刻的，取锁后先按既有顺序结算（到点开封 -> 到期清除，同刻清除
+# 优先；清空正文、连带结算请求/邀请并留审计与通知），再把结算后的状态签入
+# 快照——绝不把等锁前的未结算旧状态与审计前缀签成可信快照。
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _held_write_lock():
+    """在测试进程内占用同一数据库文件的写锁，模拟“签发已到达、等待写锁”窗口。"""
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"], timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.fixture
+def _no_sweeper(monkeypatch):
+    """停用后台扫描器：越过时刻的结算必须由被测签发请求自身在取锁后完成。"""
+    from app.main import ExpirySweeper
+
+    monkeypatch.setattr(ExpirySweeper, "sweep_once", staticmethod(lambda: 0))
+    time.sleep(0.2)  # 让进行中的扫描收尾（测试扫描间隔 0.05s）
+
+
+def _raw_db():
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _blocking_issue(client, key, doc_id):
+    """在独立线程发起会阻塞在 BEGIN IMMEDIATE 的签发请求，返回 (线程, 结果字典)。"""
+    outcome: dict = {}
+
+    def run():
+        r = _issue(client, key, doc_id)
+        outcome["status"] = r.status_code
+        outcome["text"] = r.text
+        if r.status_code == 201:
+            outcome["pkg"] = r.json()
+
+    t = threading.Thread(target=run)
+    return t, outcome
+
+
+def test_issue_waiting_past_purge_signs_purged(client, _no_sweeper):
+    """签发在清除时刻前到达、取锁时清除已到点：先在同事务结算清除（正文清空、
+    进行中请求失效、待确认邀请逾期、审计与通知落库），签出的快照呈现 purged
+    与清除审计，而不是等锁前的 sealed 旧状态。"""
+    keys, doc_id, dg = _setup(client)
+    purge_at = client.put(
+        f"/documents/{doc_id}/purge",
+        json={"purge_at": _in_seconds(1.0)},
+        headers=auth(keys["owner"]),
+    ).json()["purge_at"]
+    # 一个进行中开封请求（1 票）与一份待确认交接邀请：清除时须连带结算
+    req = client.post(
+        f"/documents/{doc_id}/open-requests",
+        json={"reason": "复核", "deadline": _in_hours(2)},
+        headers=auth(keys["owner"]),
+    ).json()["request_id"]
+    client.post(f"/open-requests/{req}/approve", json={"digest": dg}, headers=auth(keys["w1"]))
+    client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_hours(1)},
+        headers=auth(keys["owner"]),
+    )
+
+    t, outcome = _blocking_issue(client, keys["owner"], doc_id)
+    with _held_write_lock():
+        t.start()
+        time.sleep(1.6)  # 签发等待写锁期间越过 1.0s 的清除时刻
+    t.join(10)
+
+    assert outcome["status"] == 201, outcome["text"]
+    assert BODY not in outcome["text"]  # 响应不含正文
+    snap = outcome["pkg"]["snapshot"]
+    # 快照呈现结算后的 purged 状态与清除时刻，且包含清除及连带结算审计
+    assert snap["status"] == "purged"
+    assert snap["purge_at"] == purge_at and snap["purged_at"] == purge_at
+    actions = [rec["action"] for rec in snap["records"]]
+    assert "purged" in actions
+    assert "request_invalidated" in actions
+    assert "handover_invitation_expired" in actions
+    assert snap["audit_upto"] == snap["records"][-1]["seq"]
+
+    # 结算已随签发事务落库：正文清空、请求失效旧票删除、邀请逾期、审计与通知
+    with _raw_db() as conn:
+        row = conn.execute(
+            "SELECT status, body, purged_at FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        assert row["status"] == "purged" and row["body"] == ""
+        assert row["purged_at"] == purge_at
+        assert conn.execute(
+            "SELECT status FROM open_requests WHERE id=?", (req,)
+        ).fetchone()["status"] == "invalidated"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE request_id=?", (req,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT status FROM handover_invitations WHERE document_id=?", (doc_id,)
+        ).fetchone()["status"] == "expired"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE document_id=? AND action='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE document_id=? AND event_type='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 4
+
+    # 签出的 purged 快照可通过可信公钥验真
+    pk = _public_key(client)
+    r = _verify(client, snap, outcome["pkg"]["signature"], pk["public_key"])
+    assert r.status_code == 200, r.text
+    assert r.json()["valid"] is True and r.json()["status"] == "purged"
+
+
+def test_issue_waiting_past_earliest_open_signs_opened(client, _no_sweeper):
+    """开封先到（清除时刻仍在未来）：签发等待写锁期间越过最早开封时刻，
+    取锁后先结算到点开封，签出的快照呈现 opened 而非 waiting 时的 sealed。"""
+    keys, doc_id, dg = _setup(client)
+    # 清除安排在更晚的未来：开封先到、清除未到
+    client.put(
+        f"/documents/{doc_id}/purge",
+        json={"purge_at": _in_hours(2)},
+        headers=auth(keys["owner"]),
+    )
+    req = client.post(
+        f"/documents/{doc_id}/open-requests",
+        json={
+            "reason": "定时开封",
+            "deadline": _in_hours(3),
+            "earliest_open_at": _in_seconds(1.0),
+        },
+        headers=auth(keys["owner"]),
+    ).json()["request_id"]
+    for w in ("w1", "w2"):
+        client.post(f"/open-requests/{req}/approve", json={"digest": dg}, headers=auth(keys[w]))
+
+    t, outcome = _blocking_issue(client, keys["w1"], doc_id)  # 见证人签发同样结算
+    with _held_write_lock():
+        t.start()
+        time.sleep(1.6)  # 签发等待写锁期间越过 1.0s 的最早开封时刻
+    t.join(10)
+
+    assert outcome["status"] == 201, outcome["text"]
+    snap = outcome["pkg"]["snapshot"]
+    assert snap["status"] == "opened" and snap["opened_at"] is not None
+    assert snap["purged_at"] is None  # 清除时刻未到，不得呈现 purged
+    assert "opened" in [rec["action"] for rec in snap["records"]]
+    with _raw_db() as conn:
+        assert conn.execute(
+            "SELECT status FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()["status"] == "opened"
+    pk = _public_key(client)
+    r = _verify(client, snap, outcome["pkg"]["signature"], pk["public_key"])
+    assert r.json()["valid"] is True and r.json()["status"] == "opened"
+
+
+def test_issue_waiting_past_same_instant_purge_wins(client, _no_sweeper):
+    """最早开封与清除同刻、都在等待写锁期间到达：同刻清除优先——不开封，
+    签出的快照呈现 purged 且不含 opened 记录。"""
+    keys, doc_id, dg = _setup(client)
+    same_t = client.put(
+        f"/documents/{doc_id}/purge",
+        json={"purge_at": _in_seconds(1.0)},
+        headers=auth(keys["owner"]),
+    ).json()["purge_at"]
+    req = client.post(
+        f"/documents/{doc_id}/open-requests",
+        json={"reason": "同刻", "deadline": _in_hours(2), "earliest_open_at": same_t},
+        headers=auth(keys["owner"]),
+    ).json()["request_id"]
+    for w in ("w1", "w2"):
+        client.post(f"/open-requests/{req}/approve", json={"digest": dg}, headers=auth(keys[w]))
+
+    t, outcome = _blocking_issue(client, keys["owner"], doc_id)
+    with _held_write_lock():
+        t.start()
+        time.sleep(1.6)  # 同刻时刻在等待期间流逝
+    t.join(10)
+
+    assert outcome["status"] == 201, outcome["text"]
+    snap = outcome["pkg"]["snapshot"]
+    assert snap["status"] == "purged" and snap["opened_at"] is None
+    actions = [rec["action"] for rec in snap["records"]]
+    assert "purged" in actions and "opened" not in actions
+    with _raw_db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE event_type='opened'"
+        ).fetchone()[0] == 0
+
+
+def test_issue_before_purge_due_signs_sealed(client, _no_sweeper):
+    """清除时刻前取得写锁：不做提前结算，快照呈现 sealed（正文仍在库中）。"""
+    keys, doc_id, _ = _setup(client)
+    client.put(
+        f"/documents/{doc_id}/purge",
+        json={"purge_at": _in_seconds(2.5)},
+        headers=auth(keys["owner"]),
+    )
+
+    t, outcome = _blocking_issue(client, keys["owner"], doc_id)
+    with _held_write_lock():
+        t.start()
+        time.sleep(0.5)  # 写锁在清除时刻前释放，签发取锁时未到点
+    t.join(10)
+
+    assert outcome["status"] == 201, outcome["text"]
+    snap = outcome["pkg"]["snapshot"]
+    assert snap["status"] == "sealed"
+    assert snap["purge_at"] is not None and snap["purged_at"] is None
+    assert "purged" not in [rec["action"] for rec in snap["records"]]
+    with _raw_db() as conn:
+        row = conn.execute("SELECT status, body FROM documents WHERE id=?", (doc_id,)).fetchone()
+        assert row["status"] == "sealed" and row["body"] == BODY
+
+
+def test_concurrent_issue_and_sweeper_settle_purge_exactly_once(client):
+    """扫描器启用时，多个签发与后台扫描在清除到点后并发取锁：只有一份已提交
+    的清除结算（恰好一条 purged 审计、每名参与方恰好一条通知），各签发形成
+    各自已提交状态对应的审计前缀（均呈现 purged，均可验真），不重复结算。"""
+    keys, doc_id, dg = _setup(client)
+    purge_at = client.put(
+        f"/documents/{doc_id}/purge",
+        json={"purge_at": _in_seconds(1.0)},
+        headers=auth(keys["owner"]),
+    ).json()["purge_at"]
+    req = client.post(
+        f"/documents/{doc_id}/open-requests",
+        json={"reason": "复核", "deadline": _in_hours(2)},
+        headers=auth(keys["owner"]),
+    ).json()["request_id"]
+    client.post(f"/open-requests/{req}/approve", json={"digest": dg}, headers=auth(keys["w1"]))
+
+    # 两个签发（封存人 + 见证人）与后台扫描器一同排队等待写锁
+    t1, out1 = _blocking_issue(client, keys["owner"], doc_id)
+    t2, out2 = _blocking_issue(client, keys["w2"], doc_id)
+    with _held_write_lock():
+        t1.start()
+        t2.start()
+        time.sleep(1.6)  # 等待期间越过清除时刻；扫描器也在排队
+    t1.join(10)
+    t2.join(10)
+
+    assert out1["status"] == 201 and out2["status"] == 201
+    pk = _public_key(client)
+    uptos = []
+    for out in (out1, out2):
+        snap = out["pkg"]["snapshot"]
+        # 每份快照都对应一个已提交的一致状态：purged 且含清除审计
+        assert snap["status"] == "purged" and snap["purged_at"] == purge_at
+        assert "purged" in [rec["action"] for rec in snap["records"]]
+        assert snap["audit_upto"] == snap["records"][-1]["seq"]
+        r = _verify(client, snap, out["pkg"]["signature"], pk["public_key"])
+        assert r.status_code == 200 and r.json()["valid"] is True
+        uptos.append(snap["audit_upto"])
+    # 两份签发各自留痕，截止序号不同（后签发者包含先签发者的留痕审计）
+    assert len(set(uptos)) == 2
+
+    with _raw_db() as conn:
+        # 清除只结算一次：恰好一条 purged 审计、每名参与方恰好一条 purged 通知
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE document_id=? AND action='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE document_id=? AND event_type='purged'",
+            (doc_id,),
+        ).fetchone()[0] == 4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE document_id=? AND action='audit_snapshot_issued'",
+            (doc_id,),
+        ).fetchone()[0] == 2
 
 
 # ---------------------------------------------------------------------------
